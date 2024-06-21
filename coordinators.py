@@ -8,7 +8,6 @@ import threading
 import traceback
 import uuid
 import time
-import uvicorn
 import hypercorn.config
 from hypercorn.asyncio import serve
 from contextlib import contextmanager
@@ -25,8 +24,9 @@ from uvicorn import Config
 from interpreter import OpenInterpreter
 from commands import OpenInterpreterCommand
 
+from environment import Environment
 from modifiers import IdModifier, TaskSetModifier
-from runners import BenchmarkRunner, FakeBenchmarkRunner
+from runners import BenchmarkRunner, FakeBenchmarkRunner, Inspector, WorkerRunner
 from task import LMC, LoadedTask, ResultStatus, TaskResult, TasksStore, ZeroShotTask
 
 
@@ -79,7 +79,7 @@ def run_benchmark(benchmark: TasksStore, mod: TaskSetModifier, command: OpenInte
 
         # logger.debug(f"  Running task {zstask['id']}...")
         start = datetime.now()
-        messages  = runner.run(lt, command, DO_NOTHING, lambda: False, DO_NOTHING)
+        messages  = runner.run(lt, command, DO_NOTHING, DO_NOTHING)
         end = datetime.now()
 
         status = lt.to_result_status(messages)
@@ -122,13 +122,90 @@ class TaskLifecycle(Generic[Result]):
             for dfn in self._done_fns: dfn(result)
             return result
         return wrapped_fn  # type: ignore
+    
+
+def run_task_env(lt: LoadedTask, command: OpenInterpreterCommand, make_env: Callable[[str], Environment], worker: WorkerRunner, inspector: Inspector) -> TaskResult:
+    zstask = lt.to_zero_shot()
+    start = datetime.now()
+    name = f"{zstask['id']}_{time.time()}"
+    env = make_env(name)
+    messages = []
+    with env.use():
+        try:
+            fs = env.get_fs()
+            lt.setup_env(env)
+            messages.extend(worker.run(env, lt, command, inspector))
+            messages.extend(lt.extract_messages(env))
+            status = lt.to_result_status_env(messages, env)
+        except Exception as e:
+            inspector.log(traceback.format_exc())
+            status = "error"
+        finally:
+            end = datetime.now()
+            return {
+                "task_id": zstask["id"],
+                "command": command,
+                "prompt": zstask["prompt"],
+                "start": start,
+                "end": end,
+                "messages": messages,
+                "status": status
+            }
+
+
+def run_benchmark_worker_pool_env(
+        benchmark: TasksStore,
+        mod: TaskSetModifier,
+        command: OpenInterpreterCommand,
+        env: Callable[[str], Environment],
+        n_workers: Optional[int] = None) -> List[TaskResult]:
+    all_tasks = [benchmark.load_task(t) for t in mod.modify(benchmark.get_tasks())]
+    task_results: List[TaskResult] = []
+
+    extra_ci = benchmark.custom_instructions()
+    if extra_ci is not None and "custom_instructions" in command:
+        command["custom_instructions"] += f"\n{extra_ci}"
+
+    actual_n_workers = n_workers or os.cpu_count()
+    with ThreadPoolExecutor(max_workers=actual_n_workers) as pool:
+        logger.debug(f"Running {len(all_tasks)} tasks across {actual_n_workers} threads...")
+
+        zero_shots = [(lt, lt.to_zero_shot()) for lt in all_tasks]
+
+        def make_fs(id: str):
+            def start():
+                logger.debug(f"  task {id}: RUNNING...")
+            def log(s: str):
+                logger.debug(f"  task {id} log: {s}")
+            def done(r: TaskResult):
+                logger.debug(f"  task {r['task_id']}: {r['status']}!")
+            return start, log, done
+
+        # (lt: LoadedTask, command: OpenInterpreterCommand, env: Environment, worker: WorkerRunner, inspector: Inspector)
+        run_task_args = [(lt, command, env, make_fs(zs["id"])) for lt, zs in zero_shots]
+        apps = []
+        for args in run_task_args:
+            tlc = TaskLifecycle[TaskResult]()
+            start, log, done = make_fs(args[0].to_zero_shot()['id'])
+            tlc.add_start_fn(start)
+            tlc.add_done_fn(done)
+            apps.append((tlc.wrap(run_task_env), (*args[:-1], Inspector(DO_NOTHING, log))))
+        futures = [pool.submit(fn, *args) for fn, args in apps]
+        
+        for f in as_completed(futures):
+            task_results.append(f.result())
+
+        logger.debug(f"Done!")
+    
+    return task_results
 
 
 def run_task(lt: LoadedTask, command: OpenInterpreterCommand, runner: BenchmarkRunner, log) -> TaskResult:
     zstask = lt.to_zero_shot()
     start = datetime.now()
+    # if an error occurs during setup, where should it log?  probably to log.
     try:
-        messages = runner.run(lt, command, DO_NOTHING, lambda: False, log)
+        messages = runner.run(lt, command, DO_NOTHING, log)
         status = lt.to_result_status(messages)
     except Exception as e:
         strio = StringIO()
@@ -147,7 +224,7 @@ def run_task(lt: LoadedTask, command: OpenInterpreterCommand, runner: BenchmarkR
             "messages": messages,
             "status": status
         }
-
+    
 
 def run_benchmark_worker_pool(benchmark: TasksStore, mod: TaskSetModifier, command: OpenInterpreterCommand, runner: BenchmarkRunner, n_workers: Optional[int] = None) -> List[TaskResult]:
     all_tasks = [benchmark.load_task(t) for t in mod.modify(benchmark.get_tasks())]
@@ -175,11 +252,11 @@ def run_benchmark_worker_pool(benchmark: TasksStore, mod: TaskSetModifier, comma
         run_task_args = [(lt, command, runner, make_fs(zs["id"])) for lt, zs in zero_shots]
         apps = []
         for args in run_task_args:
-            # tlc = TaskLifecycle[TaskResult]()
-            # start, log, done = make_fs(args[0].to_zero_shot()['id'])
-            # tlc.add_start_fn(start)
-            # tlc.add_done_fn(done)
-            # apps.append((tlc.wrap(run_task), (*args[:-1], log)))
+            tlc = TaskLifecycle[TaskResult]()
+            start, log, done = make_fs(args[0].to_zero_shot()['id'])
+            tlc.add_start_fn(start)
+            tlc.add_done_fn(done)
+            apps.append((tlc.wrap(run_task), (*args[:-1], log)))
 
             log = lambda _: None
             apps.append((run_task, (*args[:-1], log)))
@@ -210,7 +287,7 @@ def run_benchmark_threaded(benchmark: TasksStore, mod: TaskSetModifier, command:
             zstask = lt.to_zero_shot()
             logger.debug(f"  task {zstask['id']} on thread {thread_id}: RUNNING...")
             start = datetime.now()
-            messages = runner.run(lt, command, DO_NOTHING, lambda: False, DO_NOTHING)
+            messages = runner.run(lt, command, DO_NOTHING, DO_NOTHING)
             end = datetime.now()
             status = lt.to_result_status(task)
             logger.debug(f"  task {zstask['id']} on thread {thread_id}: DONE!")
@@ -372,28 +449,6 @@ class WebSocketsManager:
             return True
 
 
-# yoinked from https://stackoverflow.com/questions/61577643/python-how-to-use-fastapi-and-uvicorn-run-without-blocking-the-thread.
-class Server(uvicorn.Server):
-    def install_signal_handlers(self):
-        pass
-
-    @contextmanager
-    def run_in_thread(self):
-        thread = threading.Thread(target=self.run)
-        thread.start()
-        try:
-            while not self.started:
-                time.sleep(1e-3)
-            yield
-        finally:
-            # self.should_exit = True
-            self.force_exit = True
-            logger.debug("about to shutdown server!")
-            asyncio.run(self.shutdown())
-            logger.debug("about to join server thread with main thread")
-            thread.join(timeout=10)
-
-
 @contextmanager
 def run_background_server(app: FastAPI):
     loop = asyncio.new_event_loop()
@@ -505,7 +560,7 @@ def run_benchmark_worker_pool_with_server(
         
         start = datetime.now()
         try:
-            messages = rnnr.run(lt, cmd, write, ws_manager.is_closed, log)
+            messages = rnnr.run(lt, cmd, write, log)
             status = lt.to_result_status(messages)
         except Exception as e:
             strio = StringIO()
@@ -590,4 +645,18 @@ class OIBenchmarks:
             results = run_benchmark_worker_pool_with_server(self.tasks, self.modifier, self.command, self.runner, self.nworkers)
         else:
             results = run_benchmark_worker_pool(self.tasks, self.modifier, self.command, self.runner, self.nworkers)
+        return results
+    
+
+@dataclass
+class OIBenchmarksEnv:
+    tasks: TasksStore
+    command: OpenInterpreterCommand
+    environment: Callable[[str], Environment]
+    modifier: TaskSetModifier = field(default_factory=IdModifier)
+    nworkers: Optional[int] = None
+    server: bool = False
+
+    def run(self) -> List[TaskResult]:
+        results = run_benchmark_worker_pool_env(self.tasks, self.modifier, self.command, self.environment, self.nworkers)
         return results

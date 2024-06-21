@@ -47,3 +47,12 @@ def wrapping_offset(a: List[T], offset: int, n: int) -> List[T]:
     actual_offset = offset % len(a)
 
     return (a[actual_offset:] + a[:actual_offset])[:actual_n]
+
+
+def get_ancestor_dirs(p: Path) -> List[Path]:
+    current = p.parent
+    ancestors: List[Path] = []
+    while current.parent != current:
+        ancestors.append(current)
+        current = current.parent
+    return list(reversed(ancestors))

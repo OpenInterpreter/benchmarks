@@ -8,9 +8,11 @@ from typing import List, Optional
 
 from constants import DATASETS, RESULTS
 from custom import CustomTasks
-from runners import DefaultBenchmarkRunner, DockerBenchmarkRunner, DockerServerBenchmarkRunner, E2BDesktopBenchmarkRunner, E2BServerTerminalBenchmarkRunner, E2BTerminalBenchmarkRunner, FakeBenchmarkRunner
+from e2b_env import make_e2b_terminal_environment
+from environment import make_docker_environment
+from runners import DefaultBenchmarkRunner, DockerBenchmarkRunner, DockerServerBenchmarkRunner, E2BDesktopBenchmarkRunner, E2BServerTerminalBenchmarkRunner, E2BTerminalBenchmarkRunner, FakeBenchmarkRunner, SimpleWorker
 from modifiers import ModifierPipe, PredModifier, SizeOffsetModifier
-from coordinators import OIBenchmarks, TaskResult
+from coordinators import OIBenchmarks, OIBenchmarksEnv, TaskResult
 from commands import commands
 from gaia import GAIAFilesOnlyModifier, GAIATask, GAIATasks
 from swe_bench import SWEBench
@@ -73,9 +75,32 @@ if __name__ == "__main__":
     save_path = default_output_file_dir / Path(f"{dt_to_str(now_utc)}-{args.command}.csv")
     print("output file:", save_path)
 
-    results = OIBenchmarks(
-        tasks=SWEBench(),
-        # tasks=GAIATasks(),
+    # results = OIBenchmarks(
+    #     # tasks=SWEBench(),
+    #     tasks=GAIATasks(),
+    #     modifier=ModifierPipe[GAIATask]([
+    #         GAIAFilesOnlyModifier(),
+    #         # PredModifier(lambda t: t["task_id"] == "df6561b2-7ee5-4540-baab-5095f742716a"),  # this one is consistently getting an error.
+    #         SizeOffsetModifier(ntasks=args.ntasks, offset=args.task_offset)
+    #     ]),
+    #     # tasks=CustomTasks.from_list([
+    #     #     {"id": "simple", "prompt": "what is 3 + 4?", "answer": "7"},
+    #     #     {"id": "hard", "prompt": "who do you think you are??", "answer": "laptop"},
+    #     # ]),
+    #     # modifier=SizeOffsetModifier(ntasks=args.ntasks, offset=args.task_offset),
+    #     command=commands[args.command],
+    #     nworkers=args.nworkers,
+    #     # runner=E2BTerminalBenchmarkRunner(),
+    #     runner=E2BServerTerminalBenchmarkRunner(),
+    #     # runner=DockerServerBenchmarkRunner(),
+    #     # runner=DockerBenchmarkRunner(),
+    #     # runner=FakeBenchmarkRunner(),
+    #     # runner=DefaultBenchmarkRunner(),
+    #     server=args.server
+    # ).run()
+    results = OIBenchmarksEnv(
+        # tasks=SWEBench(),
+        tasks=GAIATasks(),
         modifier=ModifierPipe[GAIATask]([
             # GAIAFilesOnlyModifier(),
             # PredModifier(lambda t: t["task_id"] == "df6561b2-7ee5-4540-baab-5095f742716a"),  # this one is consistently getting an error.
@@ -91,7 +116,9 @@ if __name__ == "__main__":
         # runner=E2BTerminalBenchmarkRunner(),
         # runner=E2BServerTerminalBenchmarkRunner(),
         # runner=DockerServerBenchmarkRunner(),
-        runner=DockerBenchmarkRunner(),
+        # runner=DockerBenchmarkRunner(),
+        # environment=make_docker_environment("worker"),
+        environment=make_e2b_terminal_environment(SimpleWorker()),
         # runner=FakeBenchmarkRunner(),
         # runner=DefaultBenchmarkRunner(),
         server=args.server

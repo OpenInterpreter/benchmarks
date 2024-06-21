@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 import re
 from typing import Callable, Dict, List, Optional, TypedDict, cast
 from datasets import load_dataset
@@ -7,6 +8,7 @@ from interpreter import OpenInterpreter
 
 from coordinators import LMC, TasksStore, LoadedTask, ResultStatus, TaskResult, TaskSetModifier, ZeroShotTask, judge_result
 from constants import DATASETS, GAIA
+from environment import Environment
 from utils import copy_between_fss, wrapping_offset
 
 
@@ -22,11 +24,31 @@ GAIATask = TypedDict("GAIATask", {
 
 
 class LoadedGAIATask(LoadedTask[GAIATask]):
-    def setup_input_dir(self, fs: AbstractFileSystem):
+    def setup(self, fs: AbstractFileSystem):
         if self.task["file_path"] == "":
             return
         local_fs = filesystem("file")
-        copy_between_fss(local_fs, self.task["file_path"], fs, self.task["file_name"])
+        dest_path = f"input/{self.task["file_name"]}"
+        copy_between_fss(local_fs, self.task["file_path"], fs, dest_path)
+    
+    def setup_env(self, env: Environment):
+        if self.task["file_path"] == "":
+            return
+        local_fs = filesystem("file")
+        fs = env.get_fs()
+        dest_path = f"input/{self.task["file_name"]}"
+        copy_between_fss(local_fs, self.task["file_path"], fs, dest_path)
+    
+    def extract_messages(self, env: Environment) -> List[LMC]:
+        fs = env.get_fs()
+        expected_path = "/output/messages.json"
+        print(fs.ls("/output"))
+        if not fs.exists(expected_path):
+            print("path doesn't exist!", expected_path)
+            return []
+        with fs.open(expected_path) as f:
+            messages = json.load(f)
+            return messages
     
     def to_zero_shot(self) -> ZeroShotTask:
         file_path = f"input/{self.task['file_name']}"
@@ -47,7 +69,22 @@ class LoadedGAIATask(LoadedTask[GAIATask]):
         expected = self.task["Final answer"]
         prompt = self.to_zero_shot()["prompt"]
         return judge_result(prompt, final_message["content"], expected)
-
+    
+    def to_result_status_env(self, messages: List[LMC], env: Environment) -> ResultStatus:
+        if len(messages) == 0:
+            return "unknown"
+        final_message = messages[-1]
+        if "role" not in final_message:
+            return "unknown"
+        if final_message["role"] == "error":
+            return "error"
+        if "content" not in final_message:
+            return "unknown"
+        
+        expected = self.task["Final answer"]
+        prompt = self.to_zero_shot()["prompt"]
+        return judge_result(prompt, final_message["content"], expected)
+    
 
 class GAIATasks(TasksStore[GAIATask]):
     def get_tasks(self) -> List[GAIATask]:
